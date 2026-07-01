@@ -28,131 +28,117 @@ extern "C" {
 
 #define CHECK_HR(hr, msg) do { if (FAILED(hr)) { printf("FAILED: %s (0x%08X)\n", msg, (unsigned)(hr)); return 1; } } while(0)
 
-// Hardware config: 8x16x32 u8 -> i32
-static constexpr uint32_t M = 8, N = 16, K = 32;
+// Hardware config: 8x16x16 f16 -> f16
+static constexpr uint32_t M = 8, N = 16, K = 16;
 
 struct TestParams { uint32_t tileDim, workgroupSize; };
 static const TestParams kTestCases[] = {
-    {16, 128}, {16, 256}, {16, 512}, {16, 1024},
+    {32, 128}
 };
 
-static constexpr uint8_t kValues[] = { 0, 1, 2, 3, 11, 23, 37, 71, 101 };
-
-static void FillMatrix(uint8_t* data, uint32_t cols, uint32_t rows, uint32_t offset) {
-    for (uint32_t i = 0; i < rows * cols; i++)
-        data[i] = kValues[(offset + i) % 9];
+static uint16_t F32ToF16(float v) {
+    uint32_t bits; memcpy(&bits, &v, 4);
+    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000u);
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3FFu;
+    if ((bits & 0x7FFFFFFFu) == 0) return sign;
+    if (exp <= 0) return sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
 }
 
-static void ReferenceMatMul(int32_t* out, const uint8_t* lhs, const uint8_t* rhs,
+static float F16ToF32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    int32_t  exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if      (exp == 0)  bits = sign | (mant << 13);
+    else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
+    else                bits = sign | (uint32_t)((exp - 15 + 127) << 23) | (mant << 13);
+    float r; memcpy(&r, &bits, 4);
+    return r;
+}
+
+static const float kValsF[] = { 0.0f, 1.0f, 2.0f };
+
+static void FillMatrix(uint16_t* data, uint32_t cols, uint32_t rows, uint32_t offset) {
+    for (uint32_t i = 0; i < rows * cols; i++)
+        data[i] = F32ToF16(kValsF[(offset + i) % 3]);
+}
+
+static void ReferenceMatMul(uint16_t* out, const uint16_t* lhs, const uint16_t* rhs,
     uint32_t rows, uint32_t cols, uint32_t k) {
     for (uint32_t r = 0; r < rows; r++)
         for (uint32_t c = 0; c < cols; c++) {
-            int32_t acc = 0;
+            float acc = 0.0f;
             for (uint32_t i = 0; i < k; i++)
-                acc += (int32_t)lhs[r * k + i] * (int32_t)rhs[i * cols + c];
-            out[r * cols + c] = acc;
+                acc += F16ToF32(lhs[r * k + i]) * F16ToF32(rhs[i * cols + c]);
+            out[r * cols + c] = F32ToF16(acc);
         }
 }
 
 static std::string GenerateShader(uint32_t tileDim, uint32_t workgroupSize) {
     uint32_t matRows = M * tileDim, matCols = N * tileDim, matK = K * tileDim;
-    uint32_t inputElems = matRows * matK + matK * matCols;
+    uint32_t inputElems  = matRows * matK + matK * matCols;
     uint32_t outputElems = matRows * matCols;
+    uint32_t lhsElems    = matRows * matK;
+    uint32_t strideLhs   = matK   * 2;
+    uint32_t strideRhs   = matCols * 2;
+    uint32_t strideOut   = matCols * 2;
 
     std::ostringstream s;
-    s << R"(#include <dx/linalg.h>
-using namespace dx::linalg;
 
-typedef Matrix<ComponentType::I32, )" << M << ", " << N << R"(, MatrixUse::Accumulator, MatrixScope::Wave> AccTy;
-typedef Matrix<ComponentType::U8,  )" << M << ", " << K << R"(, MatrixUse::A, MatrixScope::Wave> LhsTy;
-typedef Matrix<ComponentType::U8,  )" << K << ", " << N << R"(, MatrixUse::B, MatrixScope::Wave> RhsTy;
+    s << "#include <dx/linalg.h>\n"
+         "using namespace dx::linalg;\n\n"
+      << "typedef Matrix<ComponentType::F16, " << M << ", " << N << ", MatrixUse::Accumulator, MatrixScope::Wave> AccTy;\n"
+      << "typedef Matrix<ComponentType::F16, " << M << ", " << K << ", MatrixUse::A,           MatrixScope::Wave> LhsTy;\n"
+      << "typedef Matrix<ComponentType::F16, " << K << ", " << N << ", MatrixUse::B,           MatrixScope::Wave> RhsTy;\n\n"
+         "ByteAddressBuffer   input  : register(t0);\n"
+         "RWByteAddressBuffer output : register(u1);\n\n"
+         "void compute(uint sgid, uint num_sg) {\n";
 
-ByteAddressBuffer input : register(t0);
-RWByteAddressBuffer output : register(u1);
-
-AccTy mul_acc(LhsTy lhs, RhsTy rhs, AccTy acc) {
-    acc.MultiplyAccumulate(lhs, rhs);
-    return acc;
-}
-
-void compute(uint sgid, uint num_sg) {
-    AccTy zero = AccTy::Splat(int(0));
-)";
-
-    // Declare acc tile arrays (mimics Tint's 1D-then-2D init pattern)
-    s << "    AccTy row_init[" << tileDim << "] = {";
+    // acc array init
+    s << "    AccTy zero = AccTy::Splat(float16_t(0.0h));\n"
+      << "    AccTy acc_row[" << tileDim << "] = {";
     for (uint32_t i = 0; i < tileDim; i++) { if (i) s << ", "; s << "zero"; }
-    s << "};\n";
-    s << "    AccTy acc[" << tileDim << "][" << tileDim << "] = {";
-    for (uint32_t i = 0; i < tileDim; i++) { if (i) s << ", "; s << "row_init"; }
-    s << "};\n";
+    s << "};\n"
+      << "    AccTy acc[" << tileDim << "][" << tileDim << "] = {";
+    for (uint32_t i = 0; i < tileDim; i++) { if (i) s << ", "; s << "acc_row"; }
+    s << "};\n\n";
 
-    // Compute loop (Tint-style while with overflow counter)
-    s << R"(
-    uint2 outer_ctr = (4294967295u).xx;
-    uint kk = 0u;
-    while (true) {
-        if (all((outer_ctr == (0u).xx))) break;
-        if (kk >= )" << matK << R"(u) break;
-        {
-            uint2 mid_ctr = (4294967295u).xx;
-            uint tr = sgid;
-            while (true) {
-                if (all((mid_ctr == (0u).xx))) break;
-                if (tr >= )" << tileDim << R"(u) break;
-                {
-                    uint tc = 0u;
-                    while (true) {
-                        if (tc >= )" << tileDim << R"(u) break;
-                        uint lhs_off = (kk + ((tr * )" << M << "u) * " << matK << R"(u));
-                        LhsTy lhs = LhsTy::Splat(0u);
-                        if (((lhs_off + ()" << matK << "u * " << (M - 1) << "u)) + " << K << "u) <= " << inputElems << R"(u)
-                            lhs = LhsTy::Load(input, lhs_off, )" << matK << R"(u, MatrixLayout::RowMajor);
-                        uint rhs_off = ((tc * )" << N << "u) + (kk * " << matCols << "u)) + " << (matRows * matK) << R"(u;
-                        RhsTy rhs = RhsTy::Splat(0u);
-                        if (((rhs_off + ()" << matCols << "u * " << (K - 1) << "u)) + " << N << "u) <= " << inputElems << R"(u)
-                            rhs = RhsTy::Load(input, rhs_off, )" << matCols << R"(u, MatrixLayout::RowMajor);
-                        acc[min(tr, )" << (tileDim - 1) << R"(u)][tc] = mul_acc(lhs, rhs, acc[min(tr, )" << (tileDim - 1) << R"(u)][tc]);
-                        tc = (tc + 1u);
-                    }
-                }
-                { uint t = (mid_ctr.x - 1u); mid_ctr.x = t; mid_ctr.y = (mid_ctr.y - uint((t == 4294967295u))); tr = (tr + num_sg); }
-            }
-        }
-        { uint t = (outer_ctr.x - 1u); outer_ctr.x = t; outer_ctr.y = (outer_ctr.y - uint((t == 4294967295u))); kk = (kk + )" << K << R"(u); }
-    }
-)";
+    // compute loops
+    s << "    for (uint kk = 0u; kk < " << matK << "u; kk += " << K << "u) {\n"
+      << "        for (uint tr = sgid; tr < " << tileDim << "u; tr += num_sg) {\n"
+      << "            for (uint tc = 0u; tc < " << tileDim << "u; tc++) {\n"
+      << "                uint lhs_off = kk + tr * " << (M * matK) << "u;\n"
+         "                LhsTy lhs = LhsTy::Splat(float16_t(0.0h));\n"
+      << "                if (lhs_off + " << ((M - 1) * matK + K) << "u <= " << inputElems << "u)\n"
+      << "                    lhs = LhsTy::Load(input, lhs_off * 2u, " << strideLhs << "u, MatrixLayout::RowMajor);\n"
+      << "                uint rhs_off = tc * " << N << "u + kk * " << matCols << "u + " << lhsElems << "u;\n"
+         "                RhsTy rhs = RhsTy::Splat(float16_t(0.0h));\n"
+      << "                if (rhs_off + " << ((K - 1) * matCols + N) << "u <= " << inputElems << "u)\n"
+      << "                    rhs = RhsTy::Load(input, rhs_off * 2u, " << strideRhs << "u, MatrixLayout::RowMajor);\n"
+         "                acc[tr][tc].MultiplyAccumulate(lhs, rhs);\n"
+         "            }\n"
+         "        }\n"
+         "    }\n\n";
 
-    // Store loop
-    s << R"(
-    uint2 store_ctr = (4294967295u).xx;
-    uint str = sgid;
-    while (true) {
-        if (all((store_ctr == (0u).xx))) break;
-        if (str >= )" << tileDim << R"(u) break;
-        {
-            uint stc = 0u;
-            while (true) {
-                if (stc >= )" << tileDim << R"(u) break;
-                uint out_off = ((stc * )" << N << "u) + ((str * " << M << "u) * " << matCols << R"(u));
-                AccTy tile = acc[min(str, )" << (tileDim - 1) << R"(u)][stc];
-                if (((out_off + ()" << matCols << "u * " << (M - 1) << "u)) + " << N << "u) <= " << outputElems << R"(u)
-                    tile.Store(output, (out_off * 4u), )" << (matCols * 4) << R"(u, MatrixLayout::RowMajor);
-                stc = (stc + 1u);
-            }
-        }
-        { uint t = (store_ctr.x - 1u); store_ctr.x = t; store_ctr.y = (store_ctr.y - uint((t == 4294967295u))); str = (str + num_sg); }
-    }
-}
+    // store loops
+    s << "    for (uint tr = sgid; tr < " << tileDim << "u; tr += num_sg) {\n"
+      << "        for (uint tc = 0u; tc < " << tileDim << "u; tc++) {\n"
+      << "            uint out_off = tc * " << N << "u + tr * " << (M * matCols) << "u;\n"
+      << "            if (out_off + " << ((M - 1) * matCols + N) << "u <= " << outputElems << "u)\n"
+      << "                acc[tr][tc].Store(output, out_off * 2u, " << strideOut << "u, MatrixLayout::RowMajor);\n"
+         "        }\n"
+         "    }\n"
+         "}\n\n"
+         "struct EntryInput { uint gtid : SV_GroupIndex; };\n\n"
+      << "[numthreads(" << workgroupSize << ", 1, 1)]\n"
+         "void main_cs(EntryInput ei) {\n"
+         "    uint waveSize = WaveGetLaneCount();\n"
+      << "    compute(ei.gtid / waveSize, (" << workgroupSize << "u + waveSize - 1u) / waveSize);\n"
+         "}\n";
 
-struct EntryInput { uint gtid : SV_GroupIndex; };
-
-[numthreads()" << workgroupSize << R"(, 1, 1)]
-void dawn_entry(EntryInput ei) {
-    uint waveSize = WaveGetLaneCount();
-    compute((ei.gtid / waveSize), (()" << (workgroupSize - 1) << R"(u + waveSize) / waveSize));
-}
-)";
     return s.str();
 }
 
@@ -177,7 +163,7 @@ static ComPtr<IDxcBlob> CompileShader(const std::string& src) {
     ComPtr<IDxcBlobEncoding> blob;
     g_utils->CreateBlob(src.c_str(), (UINT)src.size(), CP_UTF8, &blob);
     DxcBuffer buf{ blob->GetBufferPointer(), blob->GetBufferSize(), CP_UTF8 };
-    const wchar_t* args[] = { L"-T", L"cs_6_10", L"-E", L"dawn_entry", L"-HV", L"2021",
+    const wchar_t* args[] = { L"-T", L"cs_6_10", L"-E", L"main_cs", L"-HV", L"2021",
                              L"-enable-16bit-types", L"-I", g_exeDir.c_str() };
     ComPtr<IDxcResult> result;
     g_compiler->Compile(&buf, args, _countof(args), g_includeHandler.Get(), IID_PPV_ARGS(&result));
@@ -207,7 +193,7 @@ static ComPtr<ID3D12Resource> CreateBuffer(ComPtr<ID3D12Device>& dev, uint32_t s
 }
 
 int main() {
-    printf("=== Subgroup Matrix Repro: %ux%ux%u u8->i32 ===\n\n", M, N, K);
+    printf("=== Subgroup Matrix Repro: %ux%ux%u f16->f16 ===\n\n", M, N, K);
 
     // Setup D3D12
     { ComPtr<ID3D12Debug> dbg; if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer(); }
@@ -221,7 +207,7 @@ int main() {
         ComPtr<IDXGIAdapter1> a;
         if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
-        if (d.VendorId == 0x8086) { intelAdapter = a; printf("GPU: %ls\n", d.Description); break; }
+        if (d.VendorId == 0x8086) { intelAdapter = a; printf("GPU: %ls (VendorId=0x%04X DeviceId=0x%04X)\n", d.Description, d.VendorId, d.DeviceId); break; }
     }
     if (!intelAdapter) { printf("No Intel GPU found\n"); return 1; }
 
@@ -282,9 +268,9 @@ int main() {
         if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) { printf("SKIP (PSO)\n"); skip++; continue; }
 
         // Data
-        uint32_t inSize = matRows * matK + matK * matCols;
-        uint32_t outElems = matRows * matCols, outSize = outElems * 4;
-        std::vector<uint8_t> lhs(matRows * matK), rhs(matK * matCols);
+        uint32_t inSize = (matRows * matK + matK * matCols) * 2;
+        uint32_t outElems = matRows * matCols, outSize = outElems * 2;
+        std::vector<uint16_t> lhs(matRows * matK), rhs(matK * matCols);
         FillMatrix(lhs.data(), matK, matRows, 0);
         FillMatrix(rhs.data(), matCols, matK, 1);
 
@@ -294,7 +280,7 @@ int main() {
         auto upload = CreateBuffer(device, inSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
         auto readback = CreateBuffer(device, outSize, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        { void* p; upload->Map(0, nullptr, &p); memcpy(p, lhs.data(), lhs.size()); memcpy((uint8_t*)p + lhs.size(), rhs.data(), rhs.size()); upload->Unmap(0, nullptr); }
+        { void* p; upload->Map(0, nullptr, &p); uint32_t lhsBytes = (uint32_t)(lhs.size() * sizeof(uint16_t)); memcpy(p, lhs.data(), lhsBytes); memcpy((uint8_t*)p + lhsBytes, rhs.data(), rhs.size() * sizeof(uint16_t)); upload->Unmap(0, nullptr); }
 
         // Descriptors
         D3D12_DESCRIPTOR_HEAP_DESC hd{ D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
@@ -347,9 +333,9 @@ int main() {
         // Verify
         void* mapped; D3D12_RANGE rr{ 0, outSize };
         readback->Map(0, &rr, &mapped);
-        auto* gpu_out = (const int32_t*)mapped;
+        auto* gpu_out = (const uint16_t*)mapped;
 
-        std::vector<int32_t> ref(outElems);
+        std::vector<uint16_t> ref(outElems);
         ReferenceMatMul(ref.data(), lhs.data(), rhs.data(), matRows, matCols, matK);
 
         uint32_t diffs = 0, firstIdx = 0;
@@ -359,8 +345,8 @@ int main() {
 
         if (!diffs) { printf("PASS\n"); pass++; }
         else {
-            printf("FAIL (%u diffs, first[%u] r=%u c=%u: exp %d got %d)\n",
-                diffs, firstIdx, firstIdx / matCols, firstIdx % matCols, ref[firstIdx], gpu_out[firstIdx]);
+            printf("FAIL (%u diffs, first[%u] r=%u c=%u: exp %.4g got %.4g)\n",
+                diffs, firstIdx, firstIdx / matCols, firstIdx % matCols, F16ToF32(ref[firstIdx]), F16ToF32(gpu_out[firstIdx]));
             fail++;
         }
         D3D12_RANGE empty{ 0, 0 }; readback->Unmap(0, &empty);
